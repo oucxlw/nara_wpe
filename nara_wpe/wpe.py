@@ -30,13 +30,16 @@ def segment_axis(
         x: The array to segment
         length: The length of each frame
         shift: The number of array elements by which to step forward
+               Negative values are also allowed.
         axis: The axis to operate on; if None, act on the flattened array
         end: What to do with the last frame, if the array is not evenly
                 divisible into pieces. Options are:
                 * 'cut'   Simply discard the extra values
                 * None    No end treatment. Only works when fits perfectly.
                 * 'pad'   Pad with a constant value
-        pad_mode:
+                * 'conv_pad' Special padding for convolution, assumes
+                             shift == 1, see example below
+        pad_mode: see numpy.pad
         pad_value: The value to use for end='pad'
 
     Examples:
@@ -141,15 +144,37 @@ def segment_axis(
         array([[ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15],
                [ 4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18,  0]])
 
+        >>> import torch
+        >>> segment_axis(torch.tensor(np.arange(10)), 4, 2)  # simple example
+        tensor([[0, 1, 2, 3],
+                [2, 3, 4, 5],
+                [4, 5, 6, 7],
+                [6, 7, 8, 9]])
     """
+    backend = {
+        'numpy': 'numpy',
+        'cupy.core.core': 'cupy',
+        'torch': 'torch',
+    }[x.__class__.__module__]
 
-    if x.__class__.__module__ == 'cupy.core.core':
+    if backend == 'numpy':
+        xp = np
+    elif backend == 'cupy':
         import cupy
         xp = cupy
+    elif backend == 'torch':
+        import torch
+        xp = torch
     else:
-        xp = np
+        raise Exception('Can not happen')
 
-    axis = axis % x.ndim
+    try:
+        ndim = x.ndim
+    except AttributeError:
+        # For Pytorch 1.2 and below
+        ndim = x.dim()
+
+    axis = axis % ndim
 
     # Implement negative shift with a positive shift and a flip
     # stride_tricks does not work correct with negative stride
@@ -169,17 +194,17 @@ def segment_axis(
     # Pad
     if end == 'pad':
         if x.shape[axis] < length:
-            npad = np.zeros([x.ndim, 2], dtype=np.int)
+            npad = np.zeros([ndim, 2], dtype=np.int)
             npad[axis, 1] = length - x.shape[axis]
             x = xp.pad(x, pad_width=npad, mode=pad_mode, **pad_kwargs)
         elif shift != 1 and (x.shape[axis] + shift - length) % shift != 0:
-            npad = np.zeros([x.ndim, 2], dtype=np.int)
+            npad = np.zeros([ndim, 2], dtype=np.int)
             npad[axis, 1] = shift - ((x.shape[axis] + shift - length) % shift)
             x = xp.pad(x, pad_width=npad, mode=pad_mode, **pad_kwargs)
 
     elif end == 'conv_pad':
         assert shift == 1, shift
-        npad = np.zeros([x.ndim, 2], dtype=np.int)
+        npad = np.zeros([ndim, 2], dtype=np.int)
         npad[axis, :] = length - shift
         x = xp.pad(x, pad_width=npad, mode=pad_mode, **pad_kwargs)
     elif end is None:
@@ -192,20 +217,53 @@ def segment_axis(
     else:
         raise ValueError(end)
 
+    # Calculate desired shape and strides
     shape = list(x.shape)
+    # assert shape[axis] >= length, shape
     del shape[axis]
     shape.insert(axis, (x.shape[axis] + shift - length) // shift)
     shape.insert(axis + 1, length)
 
-    strides = list(x.strides)
+    def get_strides(array):
+        try:
+            return list(array.strides)
+        except AttributeError:
+            # fallback for torch
+            return list(array.stride())
+
+    strides = get_strides(x)
     strides.insert(axis, shift * strides[axis])
 
-    if xp == np:
-        x = np.lib.stride_tricks.as_strided(x, strides=strides, shape=shape)
-    else:
-        x = x.view()
-        x._set_shape_and_strides(strides=strides, shape=shape)
+    # Alternative to np.ndarray.__new__
+    # I am not sure if np.lib.stride_tricks.as_strided is better.
+    # return np.lib.stride_tricks.as_strided(
+    #     x, shape=shape, strides=strides)
+    try:
+        if backend == 'numpy':
+            x = np.lib.stride_tricks.as_strided(x, strides=strides, shape=shape)
+        elif backend == 'cupy':
+            x = x.view()
+            x._set_shape_and_strides(strides=strides, shape=shape)
+        elif backend == 'torch':
+            import torch
+            x = torch.as_strided(x, size=shape, stride=strides)
+        else:
+            raise Exception('Can not happen')
 
+        # return np.ndarray.__new__(np.ndarray, strides=strides,
+        #                           shape=shape, buffer=x, dtype=x.dtype)
+    except Exception:
+        print('strides:', get_strides(x), ' -> ', strides)
+        print('shape:', x.shape, ' -> ', shape)
+        try:
+            print('flags:', x.flags)
+        except AttributeError:
+            pass  # for pytorch
+        print('Parameters:')
+        print('shift:', shift, 'Note: negative shift is implemented with a '
+                               'following flip')
+        print('length:', length, '<- Has to be positive.')
+        raise
     if do_flip:
         return xp.flip(x, axis=axis)
     else:
@@ -545,7 +603,15 @@ def wpe_v7(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode='fu
     return X
 
 
-def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode='full'):
+def wpe_v8(
+        Y,
+        taps=10,
+        delay=3,
+        iterations=3,
+        psd_context=0,
+        statistics_mode='full',
+        inplace=False
+):
     """
     Loopy Multiple Input Multiple Output Weighted Prediction Error [1, 2] implementation
     
@@ -567,6 +633,12 @@ def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode='fu
             estimation of the correlation matrix and vector.
             'valid': Only calculate correlation matrix and vector on valid
             slices of the observation.
+        inplace: Whether to change Y inplace. Has only advantages, when Y has
+            independent axes, because the core WPE algorithm does not support
+            an inplace modification of the observation.
+            This option may be relevant, when Y is so large, that you do not
+            want to double the memory consumption (i.e. save Y and the
+            dereverberated signal in the memory).
 
     Returns:
         Estimated signal with the same shape as Y
@@ -580,7 +652,7 @@ def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode='fu
     """
     ndim = Y.ndim
     if ndim == 2:
-        return wpe_v6(
+        out = wpe_v6(
             Y,
             taps=taps,
             delay=delay,
@@ -588,30 +660,25 @@ def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode='fu
             psd_context=psd_context,
             statistics_mode=statistics_mode
         )
+        if inplace:
+            Y[...] = out
+        return out
     elif ndim >= 3:
-        shape = Y.shape
-        if ndim > 3:
-            Y = Y.reshape(np.prod(shape[:-2]), *shape[-2:])
+        if inplace:
+            out = Y
+        else:
+            out = np.empty_like(Y)
 
-        batch_axis = 0
-        F = Y.shape[batch_axis]
-        index = [slice(None)] * Y.ndim
-
-        out = []
-        for f in range(F):
-            index[batch_axis] = f
-            out.append(wpe_v6(
-                Y=Y[tuple(index)],
+        for index in np.ndindex(Y.shape[:-2]):
+            out[index] = wpe_v6(
+                Y=Y[index],
                 taps=taps,
                 delay=delay,
                 iterations=iterations,
                 psd_context=psd_context,
-                statistics_mode=statistics_mode
-            ))
-        if ndim > 3:
-            return np.stack(out, axis=batch_axis).reshape(shape)
-        else:
-            return np.stack(out, axis=batch_axis)
+                statistics_mode=statistics_mode,
+            )
+        return out
     else:
         raise NotImplementedError(
             'Input shape has to be (..., D, T) and not {}.'.format(Y.shape)
@@ -632,7 +699,7 @@ def online_wpe_step(
         input_buffer: Buffer of shape (taps+delay+1, F, D)
         power_estimate: Estimate for the current PSD
         inv_cov: Current estimate of R^-1
-        filter_taps: Current estimate of filter taps (F, taps*D, taps)
+        filter_taps: Current estimate of filter taps (F, taps*D, D)
         alpha (float): Smoothing factor
         taps (int): Number of filter taps
         delay (int): Delay in frames
@@ -653,7 +720,7 @@ def online_wpe_step(
     nominator = np.einsum('fij,fj->fi', inv_cov, window)
     denominator = (alpha * power_estimate).astype(window.dtype)
     denominator += np.einsum('fi,fi->f', np.conjugate(window), nominator)
-    kalman_gain = nominator / denominator[:, None]
+    kalman_gain = nominator * _stable_positive_inverse(denominator)[:, None]
 
     inv_cov_k = inv_cov - np.einsum(
         'fj,fjm,fi->fim',
@@ -787,7 +854,7 @@ class OnlineWPE:
         nominator = np.einsum('fij,fj->fi', self.inv_cov, window)
         denominator = (self.alpha * self.power).astype(window.dtype)
         denominator += np.einsum('fi,fi->f', np.conjugate(window), nominator)
-        self.kalman_gain = nominator / denominator[:, None]
+        self.kalman_gain = nominator * _stable_positive_inverse(denominator)[:, None]
 
     def _update_power_block(self):
         self.power = np.mean(
@@ -1005,6 +1072,24 @@ def get_power(signal, psd_context=0):
     return np.squeeze(power)
 
 
+def _stable_positive_inverse(power):
+    """
+    Calculate the inverse of a positive value.
+    """
+    eps = 1e-10 * np.max(power)
+    if eps == 0:
+        # Special case when signal is zero.
+        # Does not happen on real data.
+        # This only happens in artificial cases, e.g. redacted signal parts,
+        # where the signal is set to be zero from a human.
+        #
+        # The scale of the power does not matter, so take 1.
+        inverse_power = np.ones_like(power)
+    else:
+        inverse_power = 1 / np.maximum(power, eps)
+    return inverse_power
+
+
 def get_power_inverse(signal, psd_context=0):
     """
     Assumes single frequency bin with shape (D, T).
@@ -1018,6 +1103,8 @@ def get_power_inverse(signal, psd_context=0):
     array([ 1.6       ,  2.20408163,  7.08196721, 14.04421326, 19.51219512])
     >>> get_power_inverse(s, np.inf)
     array([3.41620801, 3.41620801, 3.41620801, 3.41620801, 3.41620801])
+    >>> get_power_inverse(s * 0.)
+    array([1., 1., 1., 1., 1.])
     """
     power = np.mean(abs_square(signal), axis=-2)
 
@@ -1035,9 +1122,7 @@ def get_power_inverse(signal, psd_context=0):
         pass
     else:
         raise ValueError(psd_context)
-    eps = 1e-10 * np.max(power)
-    inverse_power = 1 / np.maximum(power, eps)
-    return inverse_power
+    return _stable_positive_inverse(power)
 
 
 def get_Psi(Y, t, taps):

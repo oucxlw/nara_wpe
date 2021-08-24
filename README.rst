@@ -10,6 +10,14 @@ nara_wpe
     :target: https://travis-ci.org/fgnt/nara_wpe
     :alt: Travis Status
     
+.. image:: https://img.shields.io/pypi/v/nara-wpe.svg
+    :target: https://pypi.org/project/nara-wpe/
+    :alt: PyPI
+
+.. image:: https://img.shields.io/pypi/dm/nara-wpe.svg
+    :target: https://pypi.org/project/nara-wpe/
+    :alt: PyPI
+
 .. image:: https://img.shields.io/badge/license-MIT-blue.svg
     :target: https://raw.githubusercontent.com/fgnt/nara_wpe/master/LICENSE
     :alt: MIT License
@@ -62,12 +70,19 @@ Citation
 To cite this implementation, you can cite the following paper::
 
     @InProceedings{Drude2018NaraWPE,
-      Title     = {{NARA-WPE: A Python package for weighted prediction error dereverberation in Numpy and Tensorflow for online and offline processing}},
+      Title     = {{NARA-WPE}: A Python package for weighted prediction error dereverberation in {Numpy} and {Tensorflow} for online and offline processing},
       Author    = {Drude, Lukas and Heymann, Jahn and Boeddeker, Christoph and Haeb-Umbach, Reinhold},
       Booktitle = {13. ITG Fachtagung Sprachkommunikation (ITG 2018)},
       Year      = {2018},
       Month     = {Oct},
     }
+
+
+To view the paper see
+`IEEE Xplore <https://ieeexplore.ieee.org/document/8578026>`__ (`PDF <https://ieeexplore.ieee.org/stamp/stamp.jsp?tp=&arnumber=8578026>`__)
+or for a preview see `Paderborn University RIS <https://ris.uni-paderborn.de/publication/11873>`__ (`PDF <https://groups.uni-paderborn.de/nt/pubs/2018/ITG_2018_Drude_Paper.pdf>`__).
+
+
 
 Comparision with the NTT WPE implementation
 ===========================================
